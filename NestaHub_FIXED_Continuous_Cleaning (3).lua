@@ -66,7 +66,6 @@ local highCashAlert = true     -- Alert on high cash drops >= 100 DH (Default ON
 local scriptKilled = false
 local isCollectingCash = false
 local lastCleanTick = 0
--- Cleaning is confirmation-driven; no client-side cooldown.
 local currentActivity = "Idle"
 
 -- Selected player for TP
@@ -894,25 +893,17 @@ local function equipBroom()
     return false
 end
 
--- Tracks spots already confirmed as cleaned during this client session.
--- The server remains authoritative: the client does not award coins or bypass server limits.
-local cleanedDirtSpots = setmetatable({}, { __mode = "k" })
-local activeCleaningSpot = nil
-local cleaningRequestPending = false
-local cleaningRequestStarted = 0
-local CLEAN_REQUEST_TIMEOUT = 4
-
 local function getClosestDirtSpot()
     local spots = getDirtSpots()
     local char = lp.Character
     if not char then return nil end
-
     local hrp = char:FindFirstChild("HumanoidRootPart")
     if not hrp then return nil end
 
-    local closest, minDist = nil, math.huge
+    local closest = nil
+    local minDist = math.huge
     for _, spot in ipairs(spots) do
-        if spot and spot.Parent and not cleanedDirtSpots[spot] then
+        if spot and spot.Parent then
             local dist = (spot.Position - hrp.Position).Magnitude
             if dist < minDist then
                 minDist = dist
@@ -920,30 +911,20 @@ local function getClosestDirtSpot()
             end
         end
     end
-
     return closest, minDist
 end
 
-local function confirmActiveCleaning()
-    if activeCleaningSpot then
-        cleanedDirtSpots[activeCleaningSpot] = true
-    end
-
-    activeCleaningSpot = nil
-    cleaningRequestPending = false
-    cleaningRequestStarted = 0
-    lastCleanTick = tick()
-end
-
 if rewardNotify then
-    rewardConn = rewardNotify.OnClientEvent:Connect(confirmActiveCleaning)
+    rewardConn = rewardNotify.OnClientEvent:Connect(function()
+        lastCleanTick = tick()
+    end)
 end
 
-local coins = lp:FindFirstChild("leaderstats")
-    and lp.leaderstats:FindFirstChild("Coins")
-
+local coins = lp:FindFirstChild("leaderstats") and lp.leaderstats:FindFirstChild("Coins")
 if coins then
-    coinsConn = coins.Changed:Connect(confirmActiveCleaning)
+    coinsConn = coins.Changed:Connect(function()
+        lastCleanTick = tick()
+    end)
 end
 
 local function runSweepingStep()
@@ -957,53 +938,55 @@ local function runSweepingStep()
 
     if hum.Sit then
         hum.Sit = false
+        task.wait()
     end
 
-    -- Both toggles are needed for teleport-and-clean mode.
-    if not autoSweep or not __r26 then return end
-
-    if not equipBroom() then return end
-
-    -- Do not keep firing the same spot. Move on when the server confirms
-    -- the reward or removes the spot from ActiveDirt.
-    if cleaningRequestPending then
-        if not activeCleaningSpot or not activeCleaningSpot.Parent then
-            confirmActiveCleaning()
-        elseif tick() - cleaningRequestStarted < CLEAN_REQUEST_TIMEOUT then
-            return
-        else
-            -- Acknowledgement timed out: allow a retry for this same spot.
-            cleaningRequestPending = false
-            activeCleaningSpot = nil
-            cleaningRequestStarted = 0
-        end
-    end
-
-    if autoCollectCash and #findCashDrops() > 0 then return end
-
-    if autoTicTacToe then
-        local _, _, hasOpponent = findBestTicTacToeBoard()
-        if hasOpponent then return end
-    end
-
-    local spot, dist = getClosestDirtSpot()
-    if not spot or not spot.Parent then return end
-
-    if autoTP then
-        -- Move to the next target immediately; the next loop selects another
-        -- spot as soon as this one is confirmed.
-        hrp.CFrame = CFrame.new(spot.Position + Vector3.new(0, 2.5, 0))
-    elseif dist > 10 then
+    if autoSweep and not equipBroom() then
         return
     end
 
-    activeCleaningSpot = spot
-    cleaningRequestPending = true
-    cleaningRequestStarted = tick()
+    if autoTP then
+        local spot = getClosestDirtSpot()
+        if not (spot and spot.Parent and __r26 and autoSweep) then
+            return
+        end
 
-    __r26:FireServer(spot.Name)
+        -- Move to this spot and send exactly one request. Do not spam the
+        -- RemoteEvent while waiting for the server to process the request.
+        hrp.CFrame = CFrame.new(spot.Position + Vector3.new(0, 2.5, 0))
+        __r26:FireServer(spot.Name)
+
+        -- Advance as soon as the server removes the completed spot. task.wait()
+        -- yields only for the next scheduler frame; it is not a fixed cooldown.
+        local startedAt = os.clock()
+        while spot.Parent and autoTP and autoSweep and not scriptKilled do
+            if staffFreezeEnabled and getNearbyStaff(staffFreezeRadius) then
+                break
+            end
+            if autoCollectCash and #findCashDrops() > 0 then
+                break
+            end
+            if autoTicTacToe then
+                local _, _, hasOpp = findBestTicTacToeBoard()
+                if hasOpp then break end
+            end
+            if os.clock() - startedAt >= 12 then
+                -- The server did not remove/confirm this spot. Stop rather
+                -- than firing repeated requests against the same target.
+                break
+            end
+            task.wait()
+        end
+        return
+    end
+
+    -- Non-teleport mode: submit once when already close enough. The server
+    -- remains authoritative about whether the spot can be cleaned.
+    local spot, dist = getClosestDirtSpot()
+    if spot and spot.Parent and dist <= 10 and autoSweep and __r26 then
+        __r26:FireServer(spot.Name)
+    end
 end
-
 
 -- ==========================================
 -- MASTER PRIORITY CONTROLLER
@@ -1062,7 +1045,7 @@ task.spawn(function()
         if autoTP or autoSweep then
             currentActivity = "Sweeping Dirt"
             runSweepingStep()
-            task.wait(0.03)
+            task.wait(0.1)
             continue
         end
 
