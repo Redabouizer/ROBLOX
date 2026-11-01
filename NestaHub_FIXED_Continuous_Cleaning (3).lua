@@ -1,115 +1,148 @@
+-- ==========================================
+-- TIER 3: OPTIMIZED CLEANING SYSTEM
+-- ==========================================
 
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CLEANING_RETRY_INTERVAL = 0.1
+local CLEANING_TIMEOUT = 12
 
-local remote = ReplicatedStorage:FindFirstChild("r26")
-if not remote then
-    remote = Instance.new("RemoteEvent")
-    remote.Name = "r26"
-    remote.Parent = ReplicatedStorage
-end
+local cleaningQueue = {}
+local queuedSpots = {}
+local isCleaning = false
 
-local active = {}
-local MAX_DISTANCE = 12
-local MAX_SPOTS = 100
+local function getActiveDirtFolder()
+    local cj = workspace:FindFirstChild("CleaningJob")
 
-local function getDirtFolder()
-    local job = workspace:FindFirstChild("CleaningJob")
-        or (workspace:FindFirstChild("GenericModels")
-            and workspace.GenericModels:FindFirstChild("CleaningJob"))
-
-    return job and job:FindFirstChild("ActiveDirt")
-end
-
-local function hasBroom(player)
-    local character = player.Character
-    return character and character:FindFirstChild("Broom") ~= nil
-end
-
-local function cleanSpot(player, spot)
-    if not spot or not spot:IsA("BasePart") then
-        return false
+    if not cj then
+        local models = workspace:FindFirstChild("GenericModels")
+        cj = models and models:FindFirstChild("CleaningJob")
     end
 
-    local character = player.Character
-    local root = character and character:FindFirstChild("HumanoidRootPart")
-
-    if not root or not hasBroom(player) then
-        return false
-    end
-
-    if (root.Position - spot.Position).Magnitude > MAX_DISTANCE then
-        return false
-    end
-
-    -- Replace this with your game's actual cleaning/reward logic.
-    spot:Destroy()
-    return true
+    return cj and cj:FindFirstChild("ActiveDirt")
 end
 
-remote.OnServerEvent:Connect(function(player, action, data)
-    if action == "cancel" then
-        active[player] = nil
-        remote:FireClient(player, "cancelled")
+local function enqueueDirtSpot(spot)
+    if not spot
+        or not spot:IsA("BasePart")
+        or not spot.Parent
+        or queuedSpots[spot] then
         return
     end
 
-    if action ~= "start" or active[player] then
-        return
-    end
+    queuedSpots[spot] = true
+    table.insert(cleaningQueue, spot)
+end
 
-    if not hasBroom(player) then
-        remote:FireClient(player, "error", "Equip the Broom first")
-        return
-    end
+local function refreshCleaningQueue()
+    local folder = getActiveDirtFolder()
+    if not folder then return end
 
-    local folder = getDirtFolder()
-    if not folder then
-        remote:FireClient(player, "error", "Dirt folder not found")
-        return
-    end
-
-    active[player] = true
-
-    task.spawn(function()
-        local ok, err = pcall(function()
-            while active[player] do
-                local spots = folder:GetChildren()
-                local found = false
-
-                for _, spot in ipairs(spots) do
-                    if not active[player] then break end
-
-                    if spot:IsA("BasePart")
-                        and spot.Name:match("^DirtSpot_%d+$") then
-
-                        found = true
-
-                        if cleanSpot(player, spot) then
-                            remote:FireClient(player, "cleaned", spot.Name)
-                        end
-                    end
-                end
-
-                if not found then
-                    break
-                end
-
-                task.wait()
-            end
-        end)
-
-        active[player] = nil
-
-        if ok then
-            remote:FireClient(player, "done")
-        else
-            warn("[CleaningServer]", err)
-            remote:FireClient(player, "error", "Cleaning failed")
+    for _, spot in ipairs(folder:GetChildren()) do
+        if spot.Name:match("^DirtSpot_%d+$") then
+            enqueueDirtSpot(spot)
         end
-    end)
-end)
+    end
+end
 
-Players.PlayerRemoving:Connect(function(player)
-    active[player] = nil
-end)
+local function getNextDirtSpot()
+    while #cleaningQueue > 0 do
+        local spot = table.remove(cleaningQueue, 1)
+        queuedSpots[spot] = nil
+
+        if spot and spot.Parent then
+            return spot
+        end
+    end
+
+    return nil
+end
+
+local function equipBroom()
+    local char = lp.Character
+    if not char then return false end
+
+    if char:FindFirstChild("Broom") then
+        return true
+    end
+
+    local backpack = lp:FindFirstChildOfClass("Backpack")
+    local broom = backpack and backpack:FindFirstChild("Broom")
+    local hum = char:FindFirstChildOfClass("Humanoid")
+
+    if broom and hum then
+        hum:EquipTool(broom)
+        return true
+    end
+
+    return false
+end
+
+local function runSweepingStep()
+    if isCleaning or scriptKilled then return end
+    if not autoTP and not autoSweep then return end
+
+    if staffFreezeEnabled
+        and getNearbyStaff(staffFreezeRadius) then
+        return
+    end
+
+    local char = lp.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+
+    if not hrp or not hum then return end
+
+    isCleaning = true
+
+    local success, err = pcall(function()
+
+        if hum.Sit then
+            hum.Sit = false
+        end
+
+        if autoSweep then
+            equipBroom()
+        end
+
+        refreshCleaningQueue()
+
+        local spot = getNextDirtSpot()
+        if not spot then return end
+
+        if autoTP then
+            hrp.CFrame = CFrame.new(
+                spot.Position + Vector3.new(0, 2.5, 0)
+            )
+        end
+
+        local startTime = os.clock()
+
+        while spot.Parent
+            and not scriptKilled
+            and (autoTP or autoSweep)
+            and os.clock() - startTime < CLEANING_TIMEOUT do
+
+            if staffFreezeEnabled
+                and getNearbyStaff(staffFreezeRadius) then
+                break
+            end
+
+            if autoSweep and not char:FindFirstChild("Broom") then
+                equipBroom()
+            end
+
+            -- Stop when the server removes the cleaned spot.
+            if not spot.Parent then
+                break
+            end
+
+            task.wait(CLEANING_RETRY_INTERVAL)
+        end
+
+    end)
+
+    if not success then
+        warn("[NestaHub] Cleaning error:", err)
+    end
+
+    isCleaning = false
+end
