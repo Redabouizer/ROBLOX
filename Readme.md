@@ -1,1 +1,1 @@
-https://drive.google.com/drive/folders/1Gvl6jpsa-1nwiWnvD5VdnXJ29ubUVXNe?usp=drive_link
+https://www.dell.com/support/home/fr-ma/drivers/driversdetails?driverid=d2kvp&utm_source=chatgpt.com
